@@ -1,24 +1,24 @@
 import streamlit as st
 import pdfplumber
 import pandas as pd
-import re
 from io import BytesIO
+import re
 
-st.set_page_config(page_title="Extractor Rekening Mandiri", layout="wide")
-st.title("📄 Extractor Rekening Koran Mandiri – FINAL FIX")
+st.set_page_config(page_title="Extractor Mandiri XY", layout="wide")
+st.title("📄 Extractor Rekening Koran Mandiri – XY Mode (FINAL)")
 
 uploaded = st.file_uploader("Upload PDF Rekening Mandiri", type=["pdf"])
 
 
-# =======================================================
-# REGEX DEFINITIONS
-# =======================================================
-r_tanggal_jam  = re.compile(r"^(?P<tgl>\d{2} \w{3} \d{4}),\s*(?P<jam>\d{2}:\d{2}:\d{2})")
-r_tanggal_only = re.compile(r"^(?P<tgl>\d{2} \w{3} \d{4}),?$")
-r_jam          = re.compile(r"^(?P<jam>\d{2}:\d{2}:\d{2})$")
-r_ref          = re.compile(r"^\d{10,}$")   # reference number
-r_amount       = re.compile(r".*?(-?\s?\d[\d.,]*)\s+(-?\s?\d[\d.,]*)\s+(-?\s?\d[\d.,]*)$")
+# =========================================================
+# HELPERS
+# =========================================================
 
+ref_pattern = re.compile(r"^\d{10,}$")
+
+amount_pattern = re.compile(
+    r"(-?\s?\d[\d.,]*)\s+(-?\s?\d[\d.,]*)\s+(-?\s?\d[\d.,]*)$"
+)
 
 def to_float(x):
     if not x:
@@ -30,133 +30,138 @@ def to_float(x):
         return None
 
 
-def extract_amount(line):
-    m = r_amount.match(line)
-    if not m:
-        return None, None, None
-    return (
-        to_float(m.group(1)),
-        to_float(m.group(2)),
-        to_float(m.group(3)),
-    )
+# =========================================================
+# XY PARSER — MANDIRI BANK LAYOUT
+# =========================================================
 
-
-# =======================================================
-# PARSER FINAL (SESUAI FORMAT KAMU)
-# =======================================================
 def parse(pdf_bytes):
     rows = []
 
-    tgl = None
-    jam = None
-    remarks = []
-    ref = ""            # angka panjang
-    amount_line = ""   # baris amount
-
-    def flush():
-        if not tgl:
-            return
-        debit, credit, saldo = extract_amount(amount_line)
-        rows.append([
-            tgl,
-            jam,
-            " ".join(remarks).strip(),
-            ref.strip(),
-            debit,
-            credit,
-            saldo
-        ])
-
     with pdfplumber.open(pdf_bytes) as pdf:
-
         for page in pdf.pages:
-            lines = page.extract_text().splitlines()
-            i = 0
 
-            while i < len(lines):
-                line = lines[i].strip()
+            # ambil semua word + koordinat
+            words = page.extract_words()
 
-                # 1) Tanggal + jam (single-line)
-                m = r_tanggal_jam.match(line)
+            # group per baris vertikal
+            lines = {}
+            for w in words:
+                top = round(w["top"])  # normalisasi
+                text = w["text"]
+
+                if top not in lines:
+                    lines[top] = []
+                lines[top].append(w)
+
+            # sort baris dari atas → bawah
+            sorted_lines = sorted(lines.items(), key=lambda x: x[0])
+
+            # state transaksi
+            tgl = None
+            jam = None
+            remarks = []
+            ref = ""
+            debit = None
+            credit = None
+            saldo = None
+
+            def flush():
+                nonlocal tgl, jam, remarks, ref, debit, credit, saldo
+                if not tgl:
+                    return
+                rows.append([
+                    tgl,
+                    jam,
+                    " ".join(remarks).strip(),
+                    ref,
+                    debit,
+                    credit,
+                    saldo
+                ])
+                # reset
+                tgl = None
+                jam = None
+                remarks = []
+                ref = ""
+                debit = credit = saldo = None
+
+            # ----------------------------------------------------
+            # PARSE TIAP BARIS
+            # ----------------------------------------------------
+            for top, wordlist in sorted_lines:
+                # sort per posisi x (kolom)
+                wordlist = sorted(wordlist, key=lambda w: w["x0"])
+                line_text = " ".join([w["text"] for w in wordlist])
+
+                # 1) TANGGAL + JAM (satu baris)
+                m = re.match(r"(\d{2} \w{3} \d{4}),\s*(\d{2}:\d{2}:\d{2})", line_text)
                 if m:
                     flush()
-
-                    tgl = m.group("tgl")
-                    jam = m.group("jam")
-                    remarks = []
-                    ref = ""
-                    amount_line = ""
-
-                    # single-line with amount
-                    d, c, s = extract_amount(line)
-                    if d is not None:
-                        amount_line = line
-                        flush()
-                        tgl = None
-                    i += 1
+                    tgl = m.group(1)
+                    jam = m.group(2)
                     continue
 
-                # 2) Tanggal saja
-                m = r_tanggal_only.match(line)
+                # 2) TANGGAL SAJA (baris berikutnya jam)
+                m = re.match(r"(\d{2} \w{3} \d{4}),$", line_text)
                 if m:
                     flush()
-
-                    tgl = m.group("tgl")
-                    remarks = []
-                    ref = ""
-                    amount_line = ""
-
-                    # jam di baris berikutnya
-                    if i + 1 < len(lines):
-                        m2 = r_jam.match(lines[i+1].strip())
-                        if m2:
-                            jam = m2.group("jam")
-                            i += 2
-                            continue
-
-                # 3) Reference number (angka panjang)
-                if r_ref.match(line):
-                    ref = line
-                    i += 1
+                    tgl = m.group(1)
                     continue
 
-                # 4) Amount
-                d, c, s = extract_amount(line)
-                if d is not None:
-                    amount_line = line
-                    i += 1
+                # 3) JAM SAJA (setelah tanggal)
+                m = re.match(r"(\d{2}:\d{2}:\d{2})$", line_text)
+                if m and tgl and jam is None:
+                    jam = m.group(1)
                     continue
 
-                # 5) Remark (hanya teks)
-                if line and not line.isdigit():     # buang angka seperti "99102"
-                    remarks.append(line)
+                # 4) AMOUNT LINE
+                m = amount_pattern.search(line_text)
+                if m:
+                    debit = to_float(m.group(1))
+                    credit = to_float(m.group(2))
+                    saldo = to_float(m.group(3))
+                    continue
 
-                i += 1
+                # 5) REFERENCE (angka panjang)
+                if ref_pattern.match(line_text):
+                    ref = line_text
+                    continue
 
-    # FLUSH terakhir
-    flush()
+                # 6) BUANG 99102
+                if line_text == "99102":
+                    continue
+
+                # 7) REMARK
+                # syarat: bukan amount, bukan reference, bukan jam, bukan tanggal
+                if not re.match(r"^\d{2} \w{3} \d{4}", line_text) \
+                   and not re.match(r"^\d{2}:\d{2}:\d{2}$", line_text) \
+                   and not ref_pattern.match(line_text):
+
+                    remarks.append(line_text)
+
+            flush()
 
     df = pd.DataFrame(rows, columns=[
-        "Tanggal", "Waktu", "Keterangan", "Reference",
-        "Debit", "Kredit", "Saldo"
+        "Tanggal","Waktu","Keterangan","Reference","Debit","Kredit","Saldo"
     ])
     return df
 
 
-# =======================================================
+# =========================================================
 # STREAMLIT EXECUTION
-# =======================================================
+# =========================================================
+
 if uploaded:
-    st.info("📥 Membaca PDF...")
+    st.info("📥 Membaca PDF (XY Mode)...")
+
     pdf_bytes = BytesIO(uploaded.read())
 
     try:
         df = parse(pdf_bytes)
         st.success("Berhasil membaca data Mandiri!")
-
         st.dataframe(df, use_container_width=True)
 
-        # EXCEL export
+        # EXCEL
         buffer = BytesIO()
         with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
             df.to_excel(writer, index=False)
@@ -165,7 +170,7 @@ if uploaded:
         st.download_button(
             "⬇️ Download Excel",
             data=buffer,
-            file_name="RekapMandiri.xlsx",
+            file_name="RekapMandiri_XY.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
