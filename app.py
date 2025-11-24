@@ -1,113 +1,129 @@
 import streamlit as st
 import pdfplumber
 import pandas as pd
+import re
 from io import BytesIO
 
-st.set_page_config(page_title="Rekap Mandiri v5 – PRESISI FINAL", layout="wide")
+st.set_page_config(page_title="Rekap Mandiri – Presisi v6", layout="wide")
+st.title("📄 Rekap Rekening Koran Mandiri – Mode Presisi v6 (No-AI, No-Auto)")
 
-st.title("📄 Rekap Mandiri – Hybrid Parser v5 (Presisi 100%)")
-
-# =====================================================================
+# =========================
 # Fungsi bantu
-# =====================================================================
+# =========================
 
-def clean_number(x):
-    if x is None:
-        return None
-    x = str(x).replace(",", "").replace(" ", "")
-    try:
-        return float(x)
-    except:
-        return None
+tanggal_re = re.compile(r"(\d{2} \w{3} \d{4}),")
+jam_re = re.compile(r"(\d{2}:\d{2}:\d{2})")
 
+def extract_transactions(text):
+    lines = text.split("\n")
+    tx_list = []
 
-# =====================================================================
-# PARSER HYBRID (100% akurat untuk Mandiri)
-# =====================================================================
+    current = {
+        "Tanggal": "",
+        "Waktu": "",
+        "Keterangan": "",
+        "Reference": "",
+        "Debit": "",
+        "Kredit": "",
+        "Saldo": ""
+    }
 
-def parse_mandiri(pdf_bytes):
-    rows = []
+    mode = "search_date"
 
-    with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
-        for page in pdf.pages:
-            extracted = page.extract_table()
+    for line in lines:
+        line = line.strip()
 
-            if not extracted:
+        # =========================
+        # DETEKSI TANGGAL BARU
+        # =========================
+        m = tanggal_re.search(line)
+        if m:
+            # simpan transaksi sebelumnya
+            if current["Tanggal"]:
+                tx_list.append(current.copy())
+
+            current = {
+                "Tanggal": m.group(1),
+                "Waktu": "",
+                "Keterangan": "",
+                "Reference": "",
+                "Debit": "",
+                "Kredit": "",
+                "Saldo": ""
+            }
+
+            # ambil jam bila di baris yang sama
+            jm = jam_re.search(line)
+            if jm:
+                current["Waktu"] = jm.group(1)
+
+            continue
+
+        # =========================
+        # DETEKSI JAM (baris kedua)
+        # =========================
+        jm = jam_re.search(line)
+        if jm and current["Waktu"] == "":
+            current["Waktu"] = jm.group(1)
+            continue
+
+        # =========================
+        # DETEKSI REFERENCE NUMBER
+        # =========================
+        if re.match(r"^\d{15,}$", line):
+            current["Reference"] = line
+            continue
+
+        # =========================
+        # DETEKSI ANGKA DEBIT/KREDIT/SALDO
+        # Urutan Mandiri: "-", debit, kredit, saldo
+        # =========================
+        if re.search(r"\d{1,3}(,\d{3})*\.\d{2}$", line):
+            nums = re.findall(r"[\d,]+\.\d{2}", line)
+            if len(nums) == 3:
+                current["Debit"], current["Kredit"], current["Saldo"] = nums
                 continue
 
-            # Bersihkan header sampah
-            clean_table = []
-            for row in extracted:
-                if row and any(cell for cell in row):
-                    clean_table.append(row)
+        # =========================
+        # SISANYA = KETERANGAN
+        # =========================
+        if line not in ["-", "", "–"]:
+            current["Keterangan"] += line + "\n"
 
-            # Cari pola tabel Mandiri:
-            # Tanggal | Waktu | Keterangan | Reference | Debit | Kredit | Saldo
-            # TANGGAL BISA KOSONG jika row lanjutan
+    # terakhir push
+    if current["Tanggal"]:
+        tx_list.append(current)
 
-            last_date = None
-            last_time = None
-
-            for r in clean_table:
-                if len(r) < 3:
-                    continue
-
-                tanggal, waktu, ket, ref, debit, kredit, saldo = (r + [None]*7)[:7]
-
-                if tanggal not in [None, ""]:
-                    last_date = tanggal
-                else:
-                    tanggal = last_date
-
-                if waktu not in [None, ""]:
-                    last_time = waktu
-                else:
-                    waktu = last_time
-
-                rows.append([
-                    tanggal,
-                    waktu,
-                    ket,
-                    ref,
-                    clean_number(debit),
-                    clean_number(kredit),
-                    saldo
-                ])
-
-    df = pd.DataFrame(rows, columns=["Tanggal", "Waktu", "Keterangan", "Reference", "Debit", "Kredit", "Saldo"])
-
-    # DROP baris yang tidak mengandung transaksi
-    df = df[df["Keterangan"].notna()]
-
-    # Reset index
-    df.reset_index(drop=True, inplace=True)
-    return df
+    return tx_list
 
 
-# =====================================================================
-# UI ==================================================================
-# =====================================================================
+# =========================
+# UI
+# =========================
 
-uploaded = st.file_uploader("Unggah PDF Rekening Koran Mandiri", type=["pdf"])
+uploaded = st.file_uploader("Unggah PDF Rekening Mandiri", type=["pdf"])
 
 if uploaded:
     pdf_bytes = uploaded.read()
 
-    st.info("📌 Parsing dengan Hybrid Parser v5… mohon tunggu.")
-    df = parse_mandiri(pdf_bytes)
+    all_text = ""
+    with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
+        for page in pdf.pages:
+            all_text += page.extract_text() + "\n"
 
-    st.success("✔ Parsing selesai – Hybrid Parser v5 (Akurat 100%)")
+    transactions = extract_transactions(all_text)
 
-    st.dataframe(df, height=400, use_container_width=True)
+    df = pd.DataFrame(transactions)
+    df["Keterangan"] = df["Keterangan"].str.strip()
+
+    st.success(f"Parsing selesai – Mode Presisi v6 (Total {len(df)} transaksi).")
+    st.dataframe(df, use_container_width=True)
 
     # Download Excel
     output = BytesIO()
     df.to_excel(output, index=False)
-    output.seek(0)
-
     st.download_button(
-        "⬇ Download Rekap Mandiri v5 (Excel)",
-        data=output,
-        file_name="Rekap_Mandiri_v5.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        "⬇ Download Rekap Mandiri v6 (Excel)",
+        data=output.getvalue(),
+        file_name="Rekap_Mandiri_v6.xlsx"
     )
