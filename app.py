@@ -3,142 +3,141 @@ import pdfplumber
 import pandas as pd
 import re
 from io import BytesIO
+import datetime
 
-st.set_page_config(layout="wide", page_title="Extractor Mandiri - CorpRFL")
 
-# =====================
-# Styling
-# =====================
+st.set_page_config(page_title="Extractor Mandiri - CorpRFL", layout="wide")
+
+# ============================ UI THEME ===============================
 st.markdown("""
 <style>
 body { background-color:#0d1117 !important; color:white !important; }
 .stButton>button { background:#0070C0 !important; color:white !important; border-radius:8px; padding:8px 16px; }
 </style>
-<h2>📘 Extractor Rekening Koran Mandiri</h2>
+<h2>📘 Extractor Rekening Koran Mandiri – CorpRFL</h2>
 <p>By Reza Fahlevi Lubis BKP @zavibis</p>
 """, unsafe_allow_html=True)
 
-# =====================
-# Helper: Format angka ke INDONESIA
-# =====================
-def normalize_number(raw):
-    """
-    Convert Mandiri number format:
-    '266,000,296.00' → 266000296.00 (float)
-    """
-    if raw is None:
+
+# ============================ FORMATTER ===============================
+def to_float(num):
+    """Convert Mandiri number to float."""
+    if not num or num == "-" or num.strip() == "":
         return 0.0
-    raw = raw.strip()
-    if raw == "" or raw == "-":
-        return 0.0
-    # Hapus pemisah ribuan
-    raw = raw.replace(".", "").replace(",", ".")
+    num = num.replace(".", "").replace(",", ".")
     try:
-        return float(raw)
+        return float(num)
     except:
         return 0.0
 
-def format_indonesia(num):
-    """
-    Output final:
-    - No thousand separator
-    - Decimal comma
-    Example:
-    266000296.0 → '266000296,00'
-    """
+
+def indo(num):
+    """Format float -> decimal comma, no thousand separators."""
     return f"{num:,.2f}".replace(",", "_").replace(".", ",").replace("_", "")
 
-# =====================
-# Upload section
-# =====================
-uploaded = st.file_uploader("Upload PDF Mandiri", type=["pdf"])
-if not uploaded:
-    st.stop()
 
-# =====================
-# AUTOPARSE LEVEL-4
-# =====================
-rows = []
-nomor_rekening = ""
-currency = "IDR"
-saldo_awal = None
+# ============================ PARSER ===============================
+def parse_mandiri(pdf):
+    rows = []
+    nomor_rekening = ""
+    saldo_awal = None
+    currency = "IDR"
 
-with pdfplumber.open(uploaded) as pdf:
     for page in pdf.pages:
-        text = page.extract_text() or ""
+        words = page.extract_words(use_text_flow=True, keep_blank_chars=False)
 
-        # Detect account number di header
-        m = re.search(r"\b(\d{10,16})\b", text)
+        # Detect account number from header
+        header_text = page.extract_text()
+        m = re.search(r"\b(\d{10,16})\b", header_text or "")
         if m:
             nomor_rekening = m.group(1)
 
-        # Split lines
-        lines = text.splitlines()
+        # Group words by line (y0 clone)
+        lines = {}
+        for w in words:
+            y = round(w["top"])
+            if y not in lines:
+                lines[y] = []
+            lines[y].append(w)
+
+        # Sort line by Y ascending
+        sorted_lines = sorted(lines.items(), key=lambda x: x[0])
+
         buffer_ket = []
 
-        for ln in lines:
-            # Cari 3 angka terakhir (Debit - Kredit - Saldo)
-            angka = re.findall(r"\d[\d.,]*", ln)
+        for y, items in sorted_lines:
+            # Sort text inside line by x0
+            items = sorted(items, key=lambda x: x["x0"])
+            line_text = " ".join([i["text"] for i in items])
 
-            if len(angka) >= 3:
-                # Ambil 3 angka terakhir
-                debit_raw = angka[-3]
-                kredit_raw = angka[-2]
-                saldo_raw = angka[-1]
+            # Extract all numbers on this line
+            nums = re.findall(r"\d[\d.,]*", line_text)
 
-                debit = normalize_number(debit_raw)
-                kredit = normalize_number(kredit_raw)
-                saldo = normalize_number(saldo_raw)
+            if len(nums) >= 3:
+                # DEFINISI 3 ANGKA TERAKHIR = debit | kredit | saldo
+                debit_raw = nums[-3]
+                kredit_raw = nums[-2]
+                saldo_raw = nums[-1]
+
+                debit = to_float(debit_raw)
+                kredit = to_float(kredit_raw)
+                saldo = to_float(saldo_raw)
 
                 if saldo_awal is None:
                     saldo_awal = saldo
 
                 # Extract tanggal
-                tgl = re.findall(r"(\d{2} \w{3} \d{4})", ln)
+                tgl = re.findall(r"(\d{2} \w{3} \d{4})", line_text)
                 tanggal = ""
                 if tgl:
-                    # Convert 03 Oct 2025 → 03/10/2025
-                    import datetime
                     try:
-                        tanggal = datetime.datetime.strptime(tgl[0], "%d %b %Y").strftime("%d/%m/%Y")
+                        tanggal = datetime.datetime.strptime(
+                            tgl[0], "%d %b %Y"
+                        ).strftime("%d/%m/%Y")
                     except:
                         tanggal = ""
 
-                # Gabungkan remark yang stacked sebelumnya
+                # Gabung remark
                 remark = " ".join(buffer_ket).strip()
-                remark = re.sub(r"\s+", " ", remark)  # pastikan 1 baris
+                remark = re.sub(r"\s+", " ", remark)
 
                 rows.append([
                     nomor_rekening,
                     tanggal,
                     remark,
-                    format_indonesia(debit),
-                    format_indonesia(kredit),
-                    format_indonesia(saldo),
+                    indo(debit),
+                    indo(kredit),
+                    indo(saldo),
                     currency,
-                    format_indonesia(saldo_awal)
+                    indo(saldo_awal)
                 ])
 
-                buffer_ket = []  # reset remark block
+                buffer_ket = []  # reset remark
             else:
                 # Kumpulkan remark
-                buffer_ket.append(ln)
+                buffer_ket.append(line_text)
 
-# =====================
-# DataFrame
-# =====================
-df = pd.DataFrame(rows, columns=[
-    "Nomor Rekening", "Tanggal", "Keterangan",
-    "Debit", "Kredit", "Saldo", "Currency", "Saldo Awal"
-])
+    # Convert ke DataFrame
+    df = pd.DataFrame(rows, columns=[
+        "Nomor Rekening", "Tanggal", "Keterangan",
+        "Debit", "Kredit", "Saldo", "Currency", "Saldo Awal"
+    ])
+    return df
+
+
+# ============================ UPLOADER ===============================
+file = st.file_uploader("Upload PDF Rekening Koran Mandiri", type=["pdf"])
+if not file:
+    st.stop()
+
+with pdfplumber.open(file) as pdf:
+    df = parse_mandiri(pdf)
 
 st.dataframe(df, use_container_width=True)
 
-# =====================
-# DOWNLOAD FIX (BytesIO)
-# =====================
+# ============================ DOWNLOAD ===============================
 buffer = BytesIO()
-df.to_excel(buffer, index=False, engine='openpyxl')
+df.to_excel(buffer, index=False, engine="openpyxl")
 buffer.seek(0)
 
 st.download_button(
