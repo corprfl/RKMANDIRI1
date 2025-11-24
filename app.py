@@ -5,29 +5,24 @@ import re
 from io import BytesIO
 import datetime
 
+st.set_page_config(page_title="Extractor Mandiri L6 - CorpRFL", layout="wide")
 
-st.set_page_config(page_title="Extractor Mandiri - CorpRFL", layout="wide")
-
-# ============================ UI DARK MODE ===============================
+# UI
 st.markdown("""
 <style>
-body { background-color:#0d1117 !important; color:white !important; }
-.stButton>button { background:#0070C0 !important; color:white !important;
-                   border-radius:8px; padding:8px 16px; }
+body { background:#0d1117 !important; color:white !important; }
+.stButton>button { background:#0070C0 !important; color:white !important; border-radius:8px; padding:8px 16px; }
 </style>
-<h2>📘 Extractor Rekening Koran Mandiri – CorpRFL</h2>
+<h2>📘 Extractor Mandiri – LEVEL 6 (Premium Parser)</h2>
 <p>By Reza Fahlevi Lubis BKP @zavibis</p>
 """, unsafe_allow_html=True)
 
 
-# =============== FORMATTER =================
+# ===========================================
+# FORMATTER
+# ===========================================
 def to_float(num):
-    """
-    Convert Mandiri number string → float.
-    Example:
-      '266,000,296.00' → 266000296.00 (float)
-    """
-    if num is None or num.strip() == "" or num == "-":
+    if not num or num in ["-", ""]:
         return 0.0
     num = num.replace(".", "").replace(",", ".")
     try:
@@ -37,63 +32,56 @@ def to_float(num):
 
 
 def indo(num):
-    """
-    Format float → Indonesian format:
-    - no thousand separator
-    - decimal comma
-    Example:
-      266000296.0 → '266000296,00'
-    """
     return f"{num:,.2f}".replace(",", "_").replace(".", ",").replace("_", "")
 
 
-# =======================================================================
-#                MANDIRI AUTOPARSE ENGINE – LEVEL 5
-# =======================================================================
+# ===========================================
+# LEVEL-6 PARSER (STATE MACHINE)
+# ===========================================
 def parse_mandiri(pdf):
     rows = []
+    currency = "IDR"
     nomor_rekening = ""
     saldo_awal = None
-    currency = "IDR"
 
     for page in pdf.pages:
 
-        # -------- Extract words with coordinates (X/Y) ----------
-        words = page.extract_words(use_text_flow=True, keep_blank_chars=False)
+        lines = (page.extract_text() or "").splitlines()
 
-        # -------- Detect account number (from header) ----------
-        header_text = page.extract_text() or ""
-        m = re.search(r"\b(\d{10,16})\b", header_text)
+        # detect account number
+        m = re.search(r"\b(\d{10,16})\b", "\n".join(lines))
         if m:
             nomor_rekening = m.group(1)
 
-        # -------- Group words per-line by Y coordinate ----------
-        lines = {}
-        for w in words:
-            y = round(w["top"])  # integer y
-            if y not in lines:
-                lines[y] = []
-            lines[y].append(w)
+        # state machine
+        ket_buffer = []
+        current_date = ""
 
-        # Sort ascending
-        sorted_lines = sorted(lines.items(), key=lambda x: x[0])
-        buffer_ket = []
+        for ln in lines:
+            ln_clean = ln.strip()
 
-        for y, items in sorted_lines:
-            # Sort words in a line by X position
-            items = sorted(items, key=lambda x: x["x0"])
-            line_text = " ".join([i["text"] for i in items])
+            # Detect tanggal
+            match_tgl = re.search(r"(\d{2} \w{3} \d{4})", ln_clean)
+            if match_tgl:
+                try:
+                    current_date = datetime.datetime.strptime(
+                        match_tgl.group(1), "%d %b %Y"
+                    ).strftime("%d/%m/%Y")
+                except:
+                    current_date = ""
+                continue
 
-            # Extract all numeric patterns
-            nums = re.findall(r"\d[\d.,]*", line_text)
+            # detect 3 angka terakhir untuk transaksi
+            nums = re.findall(r"\d[\d.,]*", ln_clean)
 
-            # =========== DETECT TRANSACTION LINE ==============
-            # If >= 3 numbers exist in one line → debit, kredit, saldo
             if len(nums) >= 3:
-
                 debit_raw = nums[-3]
                 kredit_raw = nums[-2]
                 saldo_raw = nums[-1]
+
+                # ignore noise: 99102, 02, 12424
+                if len(nums) < 3 or ln_clean in ["99102", "12424", "02"]:
+                    continue
 
                 debit = to_float(debit_raw)
                 kredit = to_float(kredit_raw)
@@ -102,25 +90,12 @@ def parse_mandiri(pdf):
                 if saldo_awal is None:
                     saldo_awal = saldo
 
-                # ---------- extract date ----------
-                tgl = re.findall(r"(\d{2} \w{3} \d{4})", line_text)
-                tanggal = ""
-                if tgl:
-                    try:
-                        tanggal = datetime.datetime.strptime(
-                            tgl[0], "%d %b %Y"
-                        ).strftime("%d/%m/%Y")
-                    except:
-                        tanggal = ""
-
-                # ---------- join remark ----------
-                remark = " ".join(buffer_ket).strip()
+                remark = " ".join(ket_buffer).strip()
                 remark = re.sub(r"\s+", " ", remark)
 
-                # ---------- append row ----------
                 rows.append([
                     nomor_rekening,
-                    tanggal,
+                    current_date,
                     remark,
                     indo(debit),
                     indo(kredit),
@@ -129,11 +104,10 @@ def parse_mandiri(pdf):
                     indo(saldo_awal)
                 ])
 
-                buffer_ket = []  # reset
-
+                ket_buffer = []
             else:
-                # collect remark
-                buffer_ket.append(line_text)
+                if ln_clean not in ["", "Page 1 of 2", "Page 2 of 2"]:
+                    ket_buffer.append(ln_clean)
 
     df = pd.DataFrame(rows, columns=[
         "Nomor Rekening", "Tanggal", "Keterangan",
@@ -142,8 +116,10 @@ def parse_mandiri(pdf):
     return df
 
 
-# ============================ UPLOADER ===============================
-file = st.file_uploader("Upload PDF Rekening Koran Mandiri", type=["pdf"])
+# ===========================================
+# UPLOAD
+# ===========================================
+file = st.file_uploader("Upload PDF Mandiri", type=["pdf"])
 if not file:
     st.stop()
 
@@ -152,15 +128,16 @@ with pdfplumber.open(file) as pdf:
 
 st.dataframe(df, use_container_width=True)
 
-
-# ============================ DOWNLOAD ===============================
+# ===========================================
+# DOWNLOAD
+# ===========================================
 buffer = BytesIO()
 df.to_excel(buffer, index=False, engine="openpyxl")
 buffer.seek(0)
 
 st.download_button(
     "Download Excel",
-    data=buffer,
-    file_name="mandiri_extracted.xlsx",
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    buffer,
+    "mandiri_extracted_l6.xlsx",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 )
