@@ -8,21 +8,26 @@ import datetime
 
 st.set_page_config(page_title="Extractor Mandiri - CorpRFL", layout="wide")
 
-# ============================ UI THEME ===============================
+# ============================ UI DARK MODE ===============================
 st.markdown("""
 <style>
 body { background-color:#0d1117 !important; color:white !important; }
-.stButton>button { background:#0070C0 !important; color:white !important; border-radius:8px; padding:8px 16px; }
+.stButton>button { background:#0070C0 !important; color:white !important;
+                   border-radius:8px; padding:8px 16px; }
 </style>
 <h2>📘 Extractor Rekening Koran Mandiri – CorpRFL</h2>
 <p>By Reza Fahlevi Lubis BKP @zavibis</p>
 """, unsafe_allow_html=True)
 
 
-# ============================ FORMATTER ===============================
+# =============== FORMATTER =================
 def to_float(num):
-    """Convert Mandiri number to float."""
-    if not num or num == "-" or num.strip() == "":
+    """
+    Convert Mandiri number string → float.
+    Example:
+      '266,000,296.00' → 266000296.00 (float)
+    """
+    if num is None or num.strip() == "" or num == "-":
         return 0.0
     num = num.replace(".", "").replace(",", ".")
     try:
@@ -32,11 +37,19 @@ def to_float(num):
 
 
 def indo(num):
-    """Format float -> decimal comma, no thousand separators."""
+    """
+    Format float → Indonesian format:
+    - no thousand separator
+    - decimal comma
+    Example:
+      266000296.0 → '266000296,00'
+    """
     return f"{num:,.2f}".replace(",", "_").replace(".", ",").replace("_", "")
 
 
-# ============================ PARSER ===============================
+# =======================================================================
+#                MANDIRI AUTOPARSE ENGINE – LEVEL 5
+# =======================================================================
 def parse_mandiri(pdf):
     rows = []
     nomor_rekening = ""
@@ -44,37 +57,40 @@ def parse_mandiri(pdf):
     currency = "IDR"
 
     for page in pdf.pages:
+
+        # -------- Extract words with coordinates (X/Y) ----------
         words = page.extract_words(use_text_flow=True, keep_blank_chars=False)
 
-        # Detect account number from header
-        header_text = page.extract_text()
-        m = re.search(r"\b(\d{10,16})\b", header_text or "")
+        # -------- Detect account number (from header) ----------
+        header_text = page.extract_text() or ""
+        m = re.search(r"\b(\d{10,16})\b", header_text)
         if m:
             nomor_rekening = m.group(1)
 
-        # Group words by line (y0 clone)
+        # -------- Group words per-line by Y coordinate ----------
         lines = {}
         for w in words:
-            y = round(w["top"])
+            y = round(w["top"])  # integer y
             if y not in lines:
                 lines[y] = []
             lines[y].append(w)
 
-        # Sort line by Y ascending
+        # Sort ascending
         sorted_lines = sorted(lines.items(), key=lambda x: x[0])
-
         buffer_ket = []
 
         for y, items in sorted_lines:
-            # Sort text inside line by x0
+            # Sort words in a line by X position
             items = sorted(items, key=lambda x: x["x0"])
             line_text = " ".join([i["text"] for i in items])
 
-            # Extract all numbers on this line
+            # Extract all numeric patterns
             nums = re.findall(r"\d[\d.,]*", line_text)
 
+            # =========== DETECT TRANSACTION LINE ==============
+            # If >= 3 numbers exist in one line → debit, kredit, saldo
             if len(nums) >= 3:
-                # DEFINISI 3 ANGKA TERAKHIR = debit | kredit | saldo
+
                 debit_raw = nums[-3]
                 kredit_raw = nums[-2]
                 saldo_raw = nums[-1]
@@ -86,7 +102,7 @@ def parse_mandiri(pdf):
                 if saldo_awal is None:
                     saldo_awal = saldo
 
-                # Extract tanggal
+                # ---------- extract date ----------
                 tgl = re.findall(r"(\d{2} \w{3} \d{4})", line_text)
                 tanggal = ""
                 if tgl:
@@ -97,10 +113,11 @@ def parse_mandiri(pdf):
                     except:
                         tanggal = ""
 
-                # Gabung remark
+                # ---------- join remark ----------
                 remark = " ".join(buffer_ket).strip()
                 remark = re.sub(r"\s+", " ", remark)
 
+                # ---------- append row ----------
                 rows.append([
                     nomor_rekening,
                     tanggal,
@@ -112,12 +129,12 @@ def parse_mandiri(pdf):
                     indo(saldo_awal)
                 ])
 
-                buffer_ket = []  # reset remark
+                buffer_ket = []  # reset
+
             else:
-                # Kumpulkan remark
+                # collect remark
                 buffer_ket.append(line_text)
 
-    # Convert ke DataFrame
     df = pd.DataFrame(rows, columns=[
         "Nomor Rekening", "Tanggal", "Keterangan",
         "Debit", "Kredit", "Saldo", "Currency", "Saldo Awal"
@@ -134,6 +151,7 @@ with pdfplumber.open(file) as pdf:
     df = parse_mandiri(pdf)
 
 st.dataframe(df, use_container_width=True)
+
 
 # ============================ DOWNLOAD ===============================
 buffer = BytesIO()
