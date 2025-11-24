@@ -4,118 +4,119 @@ import pandas as pd
 import re
 from io import BytesIO
 
-st.set_page_config(page_title="Extractor Rekening Koran Mandiri", layout="wide")
-st.title("📄 Extractor Rekening Koran Mandiri – Stable Version")
+st.set_page_config(page_title="Extractor Mandiri", layout="wide")
+st.title("📄 Extractor Rekening Koran Mandiri – FIX Version")
 
-uploaded = st.file_uploader("Upload PDF Rekening Mandiri", type=["pdf"])
+uploaded = st.file_uploader("Upload PDF", type=["pdf"])
 
-# ============================================================
-# Helper: clean number
-# ============================================================
-def to_float(text):
-    if not text:
+# =====================================================
+# Convert angka
+# =====================================================
+def to_float(x):
+    if not x: 
         return None
-    text = text.replace(".", "").replace(",", ".")
+    x = x.replace(".", "").replace(",", ".")
     try:
-        return float(text)
+        return float(x)
     except:
         return None
 
-# ============================================================
-# Helper: extract 3 numbers at end of transaction
-# ============================================================
+# =====================================================
+# Ambil 3 angka terakhir (debit, kredit, saldo)
+# =====================================================
 def extract_amounts(line):
-    nums = re.findall(r"\d[\d.,]*", line)
+    nums = re.findall(r"-?\d[\d.,]*", line)
     if len(nums) < 3:
         return None, None, None
-    debit = to_float(nums[-3])
-    credit = to_float(nums[-2])
-    saldo = to_float(nums[-1])
-    return debit, credit, saldo
+    return to_float(nums[-3]), to_float(nums[-2]), to_float(nums[-1])
 
-# ============================================================
-# Parser utama
-# ============================================================
-def parse_mandiri(pdf_bytes):
+# =====================================================
+# PARSER FIX TOTAL
+# =====================================================
+def parse_pdf(pdf_bytes):
 
     rows = []
-    current_tanggal = None
-    current_jam = None
-    current_remark = []
-    current_ref = ""
+    tgl = None
+    jam = None
+    remark = []
+    ref = ""
     last_amount_line = ""
 
     with pdfplumber.open(pdf_bytes) as pdf:
         for page in pdf.pages:
-            text = page.extract_text()
-            if not text:
-                continue
+            lines = page.extract_text().splitlines()
 
-            for line in text.splitlines():
+            i = 0
+            while i < len(lines):
+                line = lines[i].strip()
 
-                # Deteksi tanggal & jam
-                m = re.match(r"(\d{2} \w{3} \d{4}),\s*(\d{2}:\d{2}:\d{2})", line)
+                # ------------------------
+                # 1) DETEKSI TANGGAL
+                # ------------------------
+                m = re.match(r"(\d{2} \w{3} \d{4}),?", line)
                 if m:
-                    # Flush transaksi lama
-                    if current_tanggal:
+                    # Jika transaksi lama ada → flush
+                    if tgl:
                         debit, credit, saldo = extract_amounts(last_amount_line)
-                        rows.append([
-                            current_tanggal,
-                            current_jam,
-                            " ".join(current_remark).strip(),
-                            current_ref,
-                            debit, credit, saldo
-                        ])
+                        rows.append([tgl, jam, " ".join(remark), ref, debit, credit, saldo])
 
-                    # Reset block baru
-                    current_tanggal = m.group(1)
-                    current_jam = m.group(2)
-                    current_remark = []
-                    current_ref = ""
+                    # Ambil tanggal
+                    tgl = m.group(1)
+                    remark = []
+                    ref = ""
                     last_amount_line = ""
-                    continue
 
-                # Deteksi reference
-                if re.search(r"\d{10,}", line):
-                    current_ref = line.strip()
+                    # Ambil jam di BARIS SELANJUTNYA
+                    if i + 1 < len(lines):
+                        jam_line = lines[i+1].strip()
+                        if re.match(r"\d{2}:\d{2}:\d{2}", jam_line):
+                            jam = jam_line
+                            i += 2
+                            continue
 
-                # Jika line mengandung 3 angka → ini amount line
+                # ------------------------
+                # 2) DETEKSI REFERENCE
+                # ------------------------
+                if re.fullmatch(r"\d{10,}", line):
+                    ref = line
+
+                # ------------------------
+                # 3) DETEKSI AKHIR TRANSAKSI
+                # ------------------------
                 debit, credit, saldo = extract_amounts(line)
-                if (debit is not None and credit is not None and saldo is not None):
+                if debit is not None and credit is not None and saldo is not None:
                     last_amount_line = line
                 else:
-                    # Remark multiline
-                    if line.strip():
-                        current_remark.append(line.strip())
+                    if line:
+                        remark.append(line)
+
+                i += 1
 
     # Flush transaksi terakhir
-    if current_tanggal:
+    if tgl:
         debit, credit, saldo = extract_amounts(last_amount_line)
-        rows.append([
-            current_tanggal,
-            current_jam,
-            " ".join(current_remark).strip(),
-            current_ref,
-            debit, credit, saldo
-        ])
+        rows.append([tgl, jam, " ".join(remark), ref, debit, credit, saldo])
 
     df = pd.DataFrame(rows, columns=[
-        "Tanggal", "Waktu", "Keterangan", "Reference", "Debit", "Kredit", "Saldo"
+        "Tanggal","Waktu","Keterangan","Reference","Debit","Kredit","Saldo"
     ])
+
     return df
 
-# ============================================================
-# Eksekusi jika file diupload
-# ============================================================
+
+# =====================================================
+# EXEC — JIKA FILE DIUPLOAD
+# =====================================================
 if uploaded:
     st.info("Membaca PDF...")
-    file_data = uploaded.read()        # BACA SEKALI SAJA
+
+    file_data = uploaded.read()  # BACA SEKALI
     pdf_bytes = BytesIO(file_data)
 
     try:
-        df = parse_mandiri(pdf_bytes)
-        st.success("Berhasil membaca data rekening Mandiri!")
+        df = parse_pdf(pdf_bytes)
+        st.success("Berhasil membaca data Mandiri!")
         st.dataframe(df, use_container_width=True)
 
     except Exception as e:
-        st.error(f"❌ Error saat membaca PDF: {e}")
+        st.error(f"Error: {e}")
