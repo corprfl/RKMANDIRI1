@@ -4,12 +4,13 @@ import pandas as pd
 import re
 from io import BytesIO
 
-st.set_page_config(page_title="Rekap Mandiri v7 FINAL", layout="wide")
-st.title("📄 Rekap Rekening Koran Mandiri – v7 FINAL (Presisi 100%)")
+st.set_page_config(page_title="Rekap Mandiri v7.1 FINAL", layout="wide")
+st.title("📄 Rekap Rekening Koran Mandiri – v7.1 FINAL (Presisi 100%)")
 
-# ============================================
-#   FUNGSI BANTU
-# ============================================
+
+# ======================================================
+# REGEX / PATTERN
+# ======================================================
 
 tanggal_re = re.compile(r"(\d{2} \w{3} \d{4}),")
 jam_re = re.compile(r"(\d{2}:\d{2}:\d{2})")
@@ -22,20 +23,24 @@ BAD_LINES = [
     "Posting Date Remark Reference No. Debit Credit Balance"
 ]
 
-def clean_amount(x):
+
+# ======================================================
+# FUNCTIONS
+# ======================================================
+
+def clean_amount_float(x):
     """
-    Mandiri format: 1,234,567.89
-    Output v7:      1234567,89
+    Mandiri format:
+    '1,234,567.89' → float 1234567.89
     """
     if not x:
-        return ""
+        return None
     x = x.replace(",", "")
-    x = x.replace(" ", "")
     try:
-        val = float(x)
-        return f"{val:.2f}".replace(".", ",")
+        return float(x)
     except:
-        return ""
+        return None
+
 
 def extract_transactions(text):
     lines = text.split("\n")
@@ -45,7 +50,6 @@ def extract_transactions(text):
     def push():
         nonlocal cur, tx
         if cur and cur["Tanggal"]:
-            # Final cleanup
             cur["Keterangan"] = cur["Keterangan"].strip()
             tx.append(cur.copy())
 
@@ -57,7 +61,7 @@ def extract_transactions(text):
             continue
 
         # ==============================================
-        # DETEKSI AWAL TRANSAKSI (Tanggal)
+        # DETEKSI TRANSAKSI BARU (POSTING DATE)
         # ==============================================
         m = tanggal_re.search(line)
         if m:
@@ -67,9 +71,9 @@ def extract_transactions(text):
                 "Waktu": "",
                 "Keterangan": "",
                 "Reference": "",
-                "Debit": "",
-                "Kredit": "",
-                "Saldo": ""
+                "Debit": None,
+                "Kredit": None,
+                "Saldo": None
             }
 
             jm = jam_re.search(line)
@@ -79,7 +83,7 @@ def extract_transactions(text):
             continue
 
         # ==============================================
-        # JAM di baris berikut
+        # WAKTU BARIS BERIKUT
         # ==============================================
         if cur and cur["Waktu"] == "":
             jm = jam_re.search(line)
@@ -88,27 +92,26 @@ def extract_transactions(text):
                 continue
 
         # ==============================================
-        # REFERENCE NUMBER (nomor panjang)
+        # REFERENCE NUMBER
         # ==============================================
         if cur and re.fullmatch(r"\d{15,}", line):
             cur["Reference"] = line
             continue
 
         # ==============================================
-        # ANGKA (Debit – Kredit – Balance)
-        # Format Mandiri = "- 1,000,000.00 0.00 250,000,000.00"
+        # DEBIT – KREDIT – SALDO
         # ==============================================
         if cur and ("." in line or "," in line):
             nums = num_re.findall(line)
             if len(nums) == 3:
                 d, k, s = nums
-                cur["Debit"] = clean_amount(d)
-                cur["Kredit"] = clean_amount(k)
-                cur["Saldo"] = clean_amount(s)
+                cur["Debit"] = clean_amount_float(d)
+                cur["Kredit"] = clean_amount_float(k)
+                cur["Saldo"] = clean_amount_float(s)
                 continue
 
         # ==============================================
-        # SISANYA = KETERANGAN
+        # KETERANGAN MULTILINE
         # ==============================================
         if cur and line not in ["", "-", "–"]:
             cur["Keterangan"] += line + "\n"
@@ -117,9 +120,19 @@ def extract_transactions(text):
     return tx
 
 
-# ============================================
-#   UI
-# ============================================
+def format_comma(df):
+    """Convert float → string desimal koma untuk Excel export."""
+    out = df.copy()
+    for col in ["Debit", "Kredit", "Saldo"]:
+        out[col] = out[col].apply(
+            lambda v: "" if v is None else str(v).replace(".", ",")
+        )
+    return out
+
+
+# ======================================================
+# UI
+# ======================================================
 
 uploaded = st.file_uploader("Unggah PDF Rekening Mandiri", type=["pdf"])
 
@@ -133,23 +146,27 @@ if uploaded:
             if t:
                 text += t + "\n"
 
-    st.info("🔍 Memproses PDF dengan Mode Presisi v7…")
+    st.info("🔍 Memproses PDF dengan mode PRESISI v7.1…")
 
     tx = extract_transactions(text)
     df = pd.DataFrame(tx)
 
-    st.success(f"✔ Berhasil membaca {len(df)} transaksi. (v7 FINAL)")
+    st.success(f"✔ Berhasil membaca {len(df)} transaksi. (v7.1 FINAL)")
 
     st.dataframe(df, use_container_width=True)
 
-    # Export Excel
+    # ===========================
+    # EXPORT EXCEL (format koma)
+    # ===========================
+    excel_df = format_comma(df)
+
     output = BytesIO()
-    df.to_excel(output, index=False)
+    excel_df.to_excel(output, index=False)
     output.seek(0)
 
     st.download_button(
-        "⬇ Download Rekap Mandiri v7 (Excel)",
+        "⬇ Download Rekap Mandiri v7.1 (Excel, desimal koma)",
         data=output.getvalue(),
-        file_name="Rekap_Mandiri_v7.xlsx",
+        file_name="Rekap_Mandiri_v7.1.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
