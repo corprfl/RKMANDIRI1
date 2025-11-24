@@ -4,142 +4,141 @@ import pandas as pd
 import re
 from io import BytesIO
 
-st.set_page_config(page_title="Extractor Rekening Mandiri", layout="wide")
-st.title("📄 Extractor Rekening Mandiri – FINAL (Cluster Parser)")
+st.set_page_config(page_title="Rekap Mandiri – Presisi Final", layout="wide")
+st.title("📄 Rekap Rekening Mandiri – PRESISI FINAL")
 
+uploaded = st.file_uploader("Upload Rekening Koran Mandiri (PDF)", type=["pdf"])
 
-uploaded = st.file_uploader("Upload PDF Rekening Mandiri", type=["pdf"])
-
-
-# ============================================================
-# REGEX
-# ============================================================
-pat_tgl = re.compile(r"^\d{2} \w{3} \d{4}")
-pat_tgl_full = re.compile(r"(?P<tgl>\d{2} \w{3} \d{4})")
-pat_jam = re.compile(r"(?P<jam>\d{2}:\d{2}:\d{2})$")
-pat_ref = re.compile(r"^\d{10,}$")
-pat_amount = re.compile(r"(-?\s?\d[\d.,]*)\s+(-?\s?\d[\d.,]*)\s+(-?\s?\d[\d.,]*)$")
-
-HEADER_BAD_WORDS = [
-    "Account Statement",
-    "Posting Date",
-    "Summary",
-    "Created",
-]
-
-
-def is_header_line(text):
-    for w in HEADER_BAD_WORDS:
-        if w.lower() in text.lower():
-            return True
-    return False
+# ============================================
+# REGEX DEFINISI
+# ============================================
+re_date = re.compile(r"(\d{2} \w{3} \d{4})")
+re_time = re.compile(r"(\d{2}:\d{2}:\d{2})")
+re_ref = re.compile(r"^\d{12,}$")      # reference panjang
+re_number = re.compile(r"(-?\d[\d.,]*)")  # untuk debit/kredit/saldo
 
 
 def to_float(v):
     if not v:
         return None
-    v = v.replace(" ", "").replace(".", "").replace(",", ".")
+    v = v.replace(".", "").replace(",", ".")
     try:
         return float(v)
     except:
         return None
 
 
-# ============================================================
-# PARSER – CLUSTER PER TRANSAKSI
-# ============================================================
+# ============================================
+# PARSER FINAL FULL PRESISI
+# ============================================
 def parse(pdf_bytes):
     rows = []
-
     with pdfplumber.open(pdf_bytes) as pdf:
         for page in pdf.pages:
-            raw_lines = page.extract_text().splitlines()
 
-            # CLEAN LINE: hapus header Mandiri yg panjang
-            lines = []
-            for ln in raw_lines:
-                if not is_header_line(ln.strip()):
-                    lines.append(ln.strip())
+            words = page.extract_words()  # XY text
+            # Group berdasarkan Y-coordinate (baris)
+            lines = {}
+            for w in words:
+                y = int(w["top"])
+                text = w["text"].strip()
 
-            # CLUSTER TRANSAKSI: setiap baris tanggal memulai cluster baru
+                # skip header panjang Mandiri
+                if any(h in text.lower() for h in [
+                    "account statement",
+                    "opening balance",
+                    "closing balance",
+                    "summary",
+                    "posting date remark",
+                    "for further questions"
+                ]):
+                    continue
+
+                lines.setdefault(y, []).append(text)
+
+            # sort baris dari atas ke bawah
+            sorted_lines = dict(sorted(lines.items()))
+
+            # CLUSTER TRANSAKSI: setiap baris yang mengandung tanggal memulai transaksi baru
             clusters = []
             current = []
 
-            for ln in lines:
-                if pat_tgl.match(ln):
+            for y, parts in sorted_lines.items():
+                joined = " ".join(parts)
+
+                if re_date.search(joined):  # tanggal muncul
                     if current:
                         clusters.append(current)
-                    current = [ln]
+                    current = [joined]
                 else:
-                    if ln.strip():
-                        current.append(ln)
+                    if current:
+                        current.append(joined)
 
             if current:
                 clusters.append(current)
 
-            # ============================================================
-            # PROCESS EACH CLUSTER
-            # ============================================================
-            for blk in clusters:
+            # ============================================
+            # PROSES SETIAP CLUSTER
+            # ============================================
+            for block in clusters:
+                tanggal = waktu = ""
+                remark = ""
+                reference = ""
+                debit = kredit = saldo = None
 
-                tgl = None
-                jam = None
-                remarks = []
-                ref = ""
-                debit = credit = saldo = None
+                # AMBIL TANGGAL & JAM
+                for line in block:
+                    md = re_date.search(line)
+                    if md:
+                        tanggal = md.group(1)
+                    mt = re_time.search(line)
+                    if mt:
+                        waktu = mt.group(1)
 
-                # 1 — Ambil tanggal (selalu baris pertama cluster)
-                m = pat_tgl_full.search(blk[0])
-                if m:
-                    tgl = m.group("tgl")
+                # CARI REFERENCE
+                for line in block:
+                    sp = line.split()
+                    for token in sp:
+                        if re_ref.match(token):
+                            reference = token
 
-                # 2 — cari jam (bisa di baris 1 atau baris lain)
-                for ln in blk:
-                    m = pat_jam.search(ln)
-                    if m:
-                        jam = m.group("jam")
+                # CARI ANGGKA (DEBIT/KREDIT/SALDO)
+                for line in block:
+                    nums = re_number.findall(line)
+                    # pola Mandiri = 3 angka berturut-turut
+                    if len(nums) >= 3:
+                        # Ambil angka terakhir 3 nilai
+                        d, c, s = nums[-3:]
+                        debit = to_float(d)
+                        kredit = to_float(c)
+                        saldo = to_float(s)
                         break
 
-                # 3 — cari reference
-                for ln in blk:
-                    if pat_ref.match(ln):
-                        ref = ln.strip()
-                        break
+                # KETERANGAN = semua baris selain ref / angka / tanggal
+                kets = []
+                for line in block:
+                    if tanggal in line:
+                        continue
+                    if waktu in line:
+                        continue
+                    if reference and reference in line:
+                        continue
+                    if re_number.findall(line):
+                        continue
+                    if "99102" in line:
+                        continue
+                    if line.strip():
+                        kets.append(line.strip())
 
-                # 4 — cari amount
-                for ln in blk:
-                    m = pat_amount.search(ln)
-                    if m:
-                        debit  = to_float(m.group(1))
-                        credit = to_float(m.group(2))
-                        saldo  = to_float(m.group(3))
-                        break
-
-                # 5 — remarks = semua baris selain tanggal/jam/reference/amount
-                for ln in blk:
-                    if pat_tgl.match(ln):
-                        continue
-                    if pat_jam.search(ln):
-                        continue
-                    if pat_ref.match(ln):
-                        continue
-                    if pat_amount.search(ln):
-                        continue
-                    if ln.strip() == "99102":
-                        continue
-                    if ln.strip():
-                        remarks.append(ln.strip())
-
-                # Gabung remark jadi 1 baris
-                remarks = " ".join(remarks).strip()
+                remark = " ".join(kets).strip()
 
                 rows.append([
-                    tgl,
-                    jam,
-                    remarks,
-                    ref,
+                    tanggal,
+                    waktu,
+                    remark,
+                    reference,
                     debit,
-                    credit,
+                    kredit,
                     saldo
                 ])
 
@@ -150,30 +149,24 @@ def parse(pdf_bytes):
     return df
 
 
-# ============================================================
+# ============================================
 # STREAMLIT UI
-# ============================================================
+# ============================================
 if uploaded:
-    st.info("📥 Memproses PDF Mandiri...")
+    st.info("Membaca PDF…")
     pdf_bytes = BytesIO(uploaded.read())
+    df = parse(pdf_bytes)
+    st.success("Berhasil membaca data Mandiri (Mode Presisi Final).")
+    st.dataframe(df, use_container_width=True)
 
-    try:
-        df = parse(pdf_bytes)
-        st.success("Berhasil membaca data Mandiri (Mode Presisi).")
-        st.dataframe(df, use_container_width=True)
+    buf = BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False)
+    buf.seek(0)
 
-        # export Excel
-        buf = BytesIO()
-        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-            df.to_excel(writer, index=False)
-        buf.seek(0)
-
-        st.download_button(
-            "⬇️ Download Excel",
-            data=buf,
-            file_name="RekapMandiri_Final.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
-
-    except Exception as e:
-        st.error(f"❌ Error: {e}")
+    st.download_button(
+        "⬇️ Download Excel",
+        buf,
+        "Rekap-Mandiri-Presisi-Final.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
